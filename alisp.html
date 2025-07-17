@@ -1,0 +1,761 @@
+<html>
+<head>
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background-color: #ddd;
+  max-height: calc(100svh - 10px);
+}
+pre {
+  margin: 2px;
+  padding: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-height: 1;
+  border: solid 1px black;
+  background-color: #eee;
+  display: block;
+  width: calc(100svw - 10px);
+  max-height: calc(100svh - 10px);
+  overflow: auto;
+}
+</style>
+</head>
+<body>
+<pre id="PRE"></pre>
+<script>
+
+function print(...args) {
+  PRE.textContent +=
+    args.map(String).join('\n') + '\n';
+}
+
+// ------ SYMBOLS & TYPES ------
+
+const _null   = Symbol.for('null');
+const _bool   = Symbol.for('bool');
+const _func   = Symbol.for('func');
+const _list   = Symbol.for('list');
+const _number = Symbol.for('number');
+const _string = Symbol.for('string');
+const _symbol = Symbol.for('symbol');
+const _record = Symbol.for('record');
+const _lparen = Symbol.for('(');
+const _lbrack = Symbol.for('[');
+const _lbrace = Symbol.for('{');
+const _rparen = Symbol.for(')');
+const _rbrack = Symbol.for(']');
+const _rbrace = Symbol.for('}');
+const _quote  = Symbol.for("'");
+const _colon  = Symbol.for(':');
+const _lambda = Symbol.for('λ');
+
+// CUSTOM:
+const _ctx    = Symbol.for('ctx');
+const _code   = Symbol.for('code');
+const _args   = Symbol.for('args');
+const _argIdx = Array
+  .from({ length: 99 })
+  .map((_, i) => Symbol.for('$'+(i+1)));
+
+const type = (x) => ({
+  number: () => isNaN(x) ? _null: _number,
+  string: () => _string,
+  symbol: () => _symbol,
+  boolean: () => _bool,
+  function: () => _func,
+  undefined: () => _null,
+  object: () =>
+    x === null ? _null :
+    Array.isArray(x) ? _list :
+    _record
+ })[typeof x]?.() ?? _null;
+
+const isList   = x => type(x) === _list;
+const isFunc   = x => type(x) === _func;
+const isBool   = x => type(x) === _bool;
+const isNull   = x => type(x) === _null;
+const isRecord = x => type(x) === _record;
+const isString = x => type(x) === _string;
+const isSymbol = x => type(x) === _symbol;
+const isNumber = x => type(x) === _number;
+const isFalsey = x => x===false||isNull(x);
+const isTruthy = x => !isFalsey(x);
+
+// ------ JAVASCRIPT INTEROP ------
+
+const _id   = (x) => x;
+const _val  = (x) => isNull(x) ? null : x;
+const _gops = Object.getOwnPropertySymbols;
+const _ohop = {}.hasOwnProperty;
+const _call = (f, args=[], env=_id) => {
+  try {
+    return isFunc(f)
+      ? _val(f.apply(env, args)) :
+      args.reduce((v,k) => _val(v?.[k]),f);
+  }
+  catch (ex) {
+    console.error(ex, { f, args });
+    return null;
+  }
+};
+
+// CUSTOM:
+const symbol = (x) =>
+  isSymbol(x) ? x :
+  isString(x) || isNumber(x) || isBool(x) ? 
+    Symbol.for(x) :
+  null;
+
+// ------ PARSER ------
+
+const _lparenRE = /^[({\[]$/;
+const _numberRE = /^[+-]?\d+(\.\d*)?$/;
+const _tokensRE = new RegExp([
+  `[:'(){}\\[\\]]`,        // delimiters
+  `[^:\\s"'(){},\\[\\]]+`, // identifiers
+  `\\"([^"\\\\]|\\.)*\\"`  // strings
+].join('|'), 'gis');
+
+const parseCode = (src) => {
+  const tokens = src.match(_tokensRE);
+  const expr = parseExpr();
+  addRefs(expr, []);
+  return expr;
+  
+  function parseExpr() {
+    if (tokens.length < 1) return;
+    const t = tokens.shift();
+    const getter = ({
+      ["'"] : () => [_quote, parseExpr()],
+      null  : () => null,
+      true  : () => true,
+      false : () => false,
+      ['∞'] : () => Infinity,
+      ['+∞']: () => Infinity,
+      ['-∞']: () => -Infinity,
+    })[t];
+    return getter ? getter() : (
+      _lparenRE.test(t) ? parseBlock(t) :
+      _numberRE.test(t) ? parseFloat(t) :
+      t.startsWith('"') ? JSON.parse(t) :
+      Symbol.for(t));
+  }
+  
+  function parseBlock(start) {
+    const endToken = ({
+      '(': _rparen,
+      '[': _rbrack,
+      '{': _rbrace })[start];
+    let next, expr = [];
+    while(
+      tokens.length > 0 &&
+      (next = parseExpr()) !== endToken
+    ) { expr.push(next); }
+    if (start === '{') {
+      const entries = expr
+        .map((x, i) =>
+          x !== _colon &&
+          expr[i+1] !== _colon &&
+          (i > 1 && expr[i-1] === _colon
+            ? [expr[i-2], x]
+            : [x, x]))
+        .filter(x => x);
+      return Object.fromEntries(entries);
+    }
+    // CUSTOM:
+    if (expr[0] === _lambda) {
+      expr = {
+        [_args]: []
+          .concat(expr[1])
+          .filter(isSymbol),
+        [_code]: expr.length === 3
+          ? expr[2]
+          : expr.slice(2),
+      };
+    }
+    if (start === '[')
+      expr.brackets = true;
+    return expr;
+  }
+  
+  function addRefs(expr, refs) {
+    if (isSymbol(expr)) {
+      const r = Symbol.keyFor(expr);
+      return /^\^\d+$/.test(r) &&
+        refs.at(-parseInt(r.substring(1)));
+    }
+    if (isList(expr) || isRecord(expr)) {
+      refs = refs.concat([expr]);
+      const keys = Object
+        .keys(expr)
+        .concat(_gops(expr));
+      keys.forEach(k => {
+        const ref = addRefs(expr[k], refs);
+        if (ref) expr[k] = ref;
+      });
+    }
+  }
+};
+
+const toStr = (x, refs = []) => {
+  const ri = refs.indexOf(x);
+  refs = refs.concat([x]);
+  return (
+    ri >= 0   ? '^' + (refs.length-ri-1) :
+    isNull(x) ? 'null' :
+    isFunc(x)  ? '[func]' :
+    isString(x) ? JSON.stringify(x) :
+    isSymbol(x) ? Symbol.keyFor(x) :
+    isList(x) && x[0] === _quote ?
+      "'" + toStr(x[1]) :
+    isList(x) ?
+      (x.brackets ? '[' : '(') +
+      x.map(v => toStr(v,refs)).join(' ') +
+      (x.brackets ? ']' : ')') :
+    // CUSTOM:
+    isRecord(x) && has(x, _code) ?
+      (x.brackets ? '[' : '(') +
+      'λ(' + []
+        .concat(x[_args])
+        .filter(isSymbol)
+        .map(Symbol.keyFor)
+        .join(' ') +
+      ') ' +
+      (isList(x[_code]) &&
+       x[_code].length > 1
+        ? x[_code]
+          .map(c => toStr(c, refs))
+          .join(' ')
+        : toStr(x[_code], refs)) +
+      (x.brackets ? ']' : ')') :
+    isRecord(x) ?
+      '{' + Object
+        .keys(x).concat(_gops(x))
+        .map(k =>
+          toStr(k, refs) + ':' +
+          toStr(x[k], refs))
+        .join(' ') +
+      '}' :
+    x === +Infinity    ? '∞'  :
+    x === -Infinity    ? '-∞' :
+    x === 0 && 1/x < 0 ? '-0' :    
+    String(x));
+};
+
+// ------ INTERPRETER ------
+
+// (f x (y) (z 1))  ->  f(x, y(), z(1))
+const eval = (expr, env) => {
+  if (isSymbol(expr))
+    return _call(env, [expr]);
+  if (!isList(expr)) return expr;
+  if (expr.length < 1) return null;
+  const op = eval(expr[0], env);
+  const args = op.syntax
+    ? expr.slice(1)
+    : expr.slice(1).map(x => eval(x, env));
+  return _call(op, args);
+};
+
+// (f a (b) ((c)))    ->  f(a)(b())(c()())
+// (f (x 1) (y 2 3))  ->  f(x(1))(y(2)(3))
+const curryEval = (expr, env) => {
+  if (isSymbol(expr))
+    return _call(env, [expr]);
+  if (!isList(expr)) return expr;
+  if (expr.length < 1) return null;
+  const op = curryEval(expr[0], env);
+  if (expr.length < 2)
+    return _call(op, []);
+  const args = expr.slice(1);
+  return args.reduce((obj, a) =>
+    _call(obj, obj?.syntax
+      ? [a]
+      : [curryEval(arg, env)]),
+    op);
+};
+
+const lambda = Object.assign(
+  (params, code, env) =>
+    Object.assign(function f(...args) {
+      const outer = env ?? this;
+      const eval = _call(env, [_eval]);
+      const ctx = new Map(f.params
+        .map((p, i) => [p, args[i]])
+        .concat([_args, args]));
+      const result = _call(eval, [f.code], 
+        (sym) => ctx.has(ctx, sym)
+          ? ctx.get(sym)
+          : _call(outer, [sym]));
+      return result;
+    }, { params, code, env }),
+  { syntax: true });
+
+// ------ OLD RUNTIME ------
+
+const findCtx = (ctx, id) =>
+  has(ctx, id) ? ctx :
+  !has(ctx, _ctx) ? null :
+  findCtx(ctx[_ctx], id);
+
+const lookup = (id, ctx) =>
+  isSymbol(id)
+    ? _val(findCtx(ctx, id)?.[id])
+    : null;
+
+const bind = (id, val, ctx) => _val(
+  (!isSymbol(id = symbol(id))) ? val :
+  (findCtx(ctx, id) ?? ctx)[id] = val
+);
+
+const unbind = (id, ctx) =>
+  isSymbol(id = symbol(id)) &&
+  delete (findCtx(ctx, id) ?? ctx)[id];
+
+const oldEval = (expr, ctx = {}) =>
+  isSymbol(expr) ? lookup(expr, ctx) :
+  expr?.[0] === _quote ? expr[1] :
+  isList(expr) ? apply(
+    oldEval(expr[0], ctx),
+    expr.slice(1).map(x => oldEval(x,ctx)),
+    ctx) :
+  has(expr, _code) ? 
+    { [_ctx]: ctx, ...expr } :
+  _val(expr);
+
+const apply = (op, args, ctx = {}) => {
+  if (isFunc(op)) {
+    try {
+      return _val(op.apply(ctx, args));
+    } catch (ex) {
+      console.error(ex);
+      return null;      
+    }
+  }
+  if (!has(op, _code)) return op;
+  const parentCtx = isRecord(op[_ctx])
+    ? op[_ctx]
+    : ctx;
+  const newCtx = { [_ctx]: parentCtx };
+  args.forEach((val, i) => {
+    newCtx[_argIdx[i]] = val;
+  });
+  const argNames = op[_args];
+  if (isList(argNames)) {
+    argNames.forEach((an, i) => {
+      if (isSymbol(an = symbol(an))) {
+        newCtx[an] = args[i] ?? null;
+      }
+    });
+  }
+  newCtx[_args] = args.slice();
+  const code = op[_code];
+  return (isFunc(code)
+    ? code.apply(newCtx, args)
+    : oldEval(code, newCtx));
+};
+
+// ------ OPERATIONS ------
+
+const _rootCtx = {};
+
+const _setFunc = (code, ctx = _rootCtx) => ({
+  [_code]: code,
+  [_ctx]: isRecord(ctx) ? ctx : null
+});
+
+const has = (x, id) => {
+  try { return _ohop.call(x, id); }
+  catch { return false; }
+};
+
+const set = _setFunc(function(id, val) {
+  return bind(id, val, this[_ctx]);
+}, null);
+
+const _delete = _setFunc(function(id) {
+  return unbind(id, this[_ctx]);
+});
+
+const and = _setFunc(function A(x,...args){
+  if (isFalsey(x)) { return false; }
+  if (args.length < 1) { return true; }
+  args[0] = apply(args[0], [], this);
+  return A.apply(this, args);
+});
+
+const or = _setFunc(function O(x,...args){
+  if (isTruthy(x)) { return true; }
+  if (args.length < 1) { return false; }
+  args[0] = apply(args[0], [], this);
+  return O.apply(this, args);
+});
+
+const _if = _setFunc(function (cond, t, f){
+  const branch = isTruthy(cond) ? t : f;
+  return apply(branch, [cond], this);
+});
+
+const _do = (...xs) => _val(xs.at(-1));
+
+const list = (...vals) => vals;
+
+const record = (keyValPairs) => {
+  const obj = {};
+  keyValPairs
+    .map(x => [].concat(x))
+    .filter(([k]) => isString(k) ||
+      isNumber(k) || isSymbol(k))
+    .forEach(([k,v]) => obj[k] = _val(v));
+  return obj;
+};
+
+const range = (...args) => {
+  const len = args.length;
+  const [s, e] =
+    len < 1 ? [1, 0] :
+    len < 2 ? [1, args[0]] :
+    args;
+  return (Array
+    .from({ length: e - s + 1 })
+    .map((_, i) => i + s));
+};
+
+const _prop = (obj, keys, ...val) => {
+  keys = [].concat(keys);
+  const hasVal = val.length > 0;
+  const hasKeys = keys.length > 0;
+  const lastKey = hasVal && keys.pop();
+  obj = keys.reduce((o, k) => o?.[k], obj);
+  return (
+    !hasVal ? obj :
+    !hasKeys ? val[0] :
+    obj && (obj[lastKey] = val[0]));
+};
+
+const _setMapFunc =
+  (wrap, mapFn, ctx = _rootCtx) =>
+  _setFunc(function (items, fn) {
+    if (isList(items))
+      return mapFn(items,
+        (v, i) => apply(fn, [v, i], this));
+    if (!isRecord(list))
+      return null;
+    const result =
+      mapFn(Object.entries(list),
+        ([k,v]) => apply(fn, [v,k], this));
+    return (wrap
+      ? Object.fromEntries(result)
+      : result);
+  }, ctx);
+
+const map = _setMapFunc(true,
+  (xs, action) => xs.map(action));
+
+const filter = _setMapFunc(true,
+  (xs, action) => xs.filter(action));
+
+const all = _setMapFunc(false,
+  (xs, action) => xs.every(action));
+
+const any = _setMapFunc(false,
+  (xs, action) => xs.some(action));
+
+const forEach =_setMapFunc(false,
+  (xs, action) =>
+    xs.every(...args =>
+      action(...args) !== false));
+      
+const find = _setMapFunc(false,
+  (xs, action) => xs.find(action));
+
+const slice = _setMapFunc(true,
+  (xs, action) => xs.slice(action));
+
+const indexOf = (xs, x) =>
+  isList(xs) || isString(xs) ? 
+    xs.indexOf(x) :
+  isRecord(xs) ?
+    Object.entries(xs)
+      .find(e => e[1] === x)?.[0] ?? null :
+  null;
+
+const length = (x) =>
+  isString(x) || isList(x) ? x.length :
+  isRecord(x) ? Object.keys(x).length :
+  null;
+  
+const concat = (x, ...args) =>
+  isList(x) ? x.concat(...args) :
+  isString(x) ? [x]
+    .concat(...args)
+    .map(s =>
+      (isSymbol(s) && Symbol.keyFor(s)) ||
+      String(s))
+    .join('') :
+  null;
+
+const push = (x, ...args) =>
+  isList(x) ? x.push(...args) : null;
+
+const pop = (x) =>
+  isList(x) ? x.pop() : null;
+  
+const _nca =_setFunc(function N(x,...args){
+  if (!isNull(x)) return x;
+  args[0] = apply(args[0], [], this);
+  return N.apply(this, args);
+});
+
+const substring = (s, ...se) =>
+  isString(s) ? s.substring(...se) : null;
+
+const keysOf = (x) =>
+  Object.keys(x).concat(_gops(x));
+
+const valuesOf = (x) =>
+  keysOf(x).map(k => x[k]);
+
+const entriesOf = (x) =>
+  Object.entries(x).concat(
+    _gops(x).map(s => [s, x[s]]));
+
+const contains = (x, val) =>
+  (isString(x) || isList(x)) &&
+  x.includes(val);
+
+const currentCtx = _setFunc(function() {
+  return this;
+}, null);
+  
+const _print = (...args) =>
+  print(...args.map(x => ': ' + toStr(x)));
+
+Object.entries({
+  type, eval: oldEval, apply,
+  lookup, bind, unbind,
+  symbol, and, or,
+  list, record, range, has,
+  map, filter, all, any, find, indexOf,
+  length, concat, push, pop, slice,
+  print: _print,
+  WINDOW: window,
+  '.': _prop,
+  'if': _if,
+  'do': _do,
+  'set!': set,
+  'bool?': isBool,
+  'func?': isFunc,
+  'null?': isNull,
+  'list?': isList,
+  'string?': isString,
+  'number?': isNumber,
+  'symbol?': isSymbol,
+  'record?': isRecord,
+  'current-ctx': currentCtx,
+  'sub-string': substring,
+  'for-each': forEach,
+  'keys-of': keysOf,
+  'values-of': valuesOf,
+  'entries-of': entriesOf,
+  'contains?': contains,
+  'delete!': _delete,
+  'not': (x) => isFalsey(x),
+  'λ': lambda,
+  '+': (...x) => x.reduce((a ,b) =>
+    isNumber(a) && isNumber(b)
+      ? a + b : null,
+    0),
+  '*': (...x) => x.reduce((a, b) =>
+    isNumber(a) && isNumber(b)
+      ? a * b : null,
+    1),
+  '^': (...x) => x.reduce((a, b) =>
+    isNumber(a) && isNumber(b)
+      ? a ** b : null,
+    1),
+  '-': (a, b) =>
+    isNumber(a) && isNumber(b)
+      ? a - b : null,
+  '/': (a, b) =>
+    isNumber(a) && isNumber(b)
+      ? a / b : null,
+  '%': (a, b) => 
+    isNumber(a) && isNumber(b)
+      ? a % b : null,
+  '<': (a, b) => a < b,
+  '>': (a, b) => a > b,
+  '≤': (a, b) => a <= b,
+  '≥': (a, b) => a >= b,
+  '=': (a, b) => a === b,
+  '≠': (a, b) => a !== b,
+  '??': _nca,
+  'E': Math.E,
+  'π': Math.PI,
+  'PI': Math.PI,
+  '∞': Infinity,
+  'abs': Math.abs,
+  'acos': Math.acos,
+  'acosh': Math.acosh,
+  'asin': Math.asin,
+  'asinh': Math.asinh,
+  'atan': Math.atan,
+  'atan2': Math.atan2,
+  'atanh': Math.atanh,
+  'cbrt': Math.cbrt,
+  'ceil': Math.ceil,
+  'cos': Math.cos,
+  'cosh': Math.cosh,
+  'exp': Math.exp,
+  'floor': Math.floor,
+  'log': Math.log10,
+  'log2': Math.log2,
+  'ln': Math.log,
+  'max': Math.max,
+  'min': Math.min,
+  'rand': Math.random,
+  'round': Math.round,
+  'sin': Math.sin,
+  'sinh': Math.sinh,
+  'sqrt': Math.sqrt,
+  'tan': Math.tan,
+  'tanh': Math.tanh,
+}).forEach(([key, val]) => {
+  _rootCtx[symbol(key)] = val;
+});
+
+// ------ TEST CODE ------
+
+const src = `(
+  (+ 1 2 3)
+  '(+ 1 2 3)
+  (list + 1 2 3)
+  (sqrt 25)
+  ([λ () 123])
+  ([λ () '(123)])
+  (list (/ 1 ∞) (/ -1 ∞) (/ 1 -∞))
+  (list (/ 1 0) (/ -1 0) (/ 1 -0))
+  (if false π [λ() * E 2])
+  (if true π [λ() + E 2])
+  (set! 'foo (* 3 4))
+  (set! 'bar foo)
+  (+ (/ foo 2)
+  (* bar 2))
+  (if 1 foo [λ() * 3 4])
+  (set! 'foo 123)
+  (set! 'ref 'foo)
+  (set! ref "abc")
+  foo
+  (set! 'self 'self)
+  self
+  (set! 'nums (list (+ 1 2) (* 3 4 5) π))
+  (map nums [λ(x) * x 2])
+  nums
+  ([delete! 'nums])
+  nums
+  (range 3 7)
+  (filter (range 20) [λ(x) < x 15])
+  (filter (range 20) [λ(x) ≥ x 11])
+  (filter (range 20) [λ(x) = 1 (% x 3)])
+  (map (range 30)
+    [λ(n) if (= 0 (% n 15))
+      'FizzBuzz
+    [λ( ) if (= 0 (% n 3))
+      'Fizz
+    [λ( ) if (= 0 (% n 5))
+      'Buzz
+    n]]])
+  (map
+    '(null true 1 "x" π (x y) {x:y}
+      [λ(x) x] 'xy '() '[] '{})
+    type)
+  (current-ctx)
+  '(1 2 (3 (^2)))
+  (set! 'obj { a:1 "b": (2 3) })
+  (. obj 'a)
+  (. obj "b")
+  (. obj '("b" 0))
+  (. obj 'a 123)
+  (. obj '("b" 1) "xyz")
+  (. obj "c" π)
+  obj
+  (record '(a "b" (c d) ("e" "f")))
+  (. "test" 1)
+  (set! 'fib
+    ([λ(fibs) [λ(i)
+      if (< i (length fibs))
+        [λ() . fibs i]
+        [λ() do
+          (set! 'len (length fibs))
+          (push fibs (+
+            (. fibs (- len 1))
+            (. fibs (- len 2))))
+          (fib i)]
+  ]] '(1 1)))
+  (map (range 0 12) fib)
+  (fib 100)
+  (concat '(1 2) 3 '(4 (5) 6))
+  (length "testing")
+  (length '(a b c d e f g h i j))
+  (set! 'stack [λ(h)
+    [λ(f) f f] [s t p|
+      [λ(x) if (> (length args) 0)
+        [λ() s s x (s s t p)]
+        [λ() do
+          (if p [λ() h t])
+          (?? p [λ() s s])]]]]])
+  (do
+    ((((((((((((((
+      (stack print)
+        1) 2)) 3) 4)) 5))))) 6)))
+    'done)
+  (record '((code )))
+  (record '((code ())))
+  (record '((code 123)))
+  (record '((code (123))))
+  (record '((code (1 2 3))))
+  (record '((code ((1 2 3)))))
+  (record '((code ((1 2) 3))))
+  (/ 100 0)
+  (/ 100 -0)
+  (/ -100 0)
+  (/ -100 -0)
+  ([λ(x)
+   [λ(y)
+   [λ(z) do
+    (set! 'w 444)
+    (current-ctx)
+   ] 333
+   ] 222
+   ] 111)
+)`.trim();
+
+const code = parseCode(src);
+const results = code.map(expr => {
+  print('> ' + toStr(expr));
+  const res = oldEval(expr, _rootCtx);
+  print('= ' + toStr(res) + '\n');
+  return res;
+});
+
+/*
+---- TODO ----
+- Replace quotes & funcs with special forms
+- OPS: regex match, switch/case, pattern-
+       matching, str/regex replace
+---- DECISIONS ----
+NO MACROS!
+ - Consistent predictable eval substitution
+ - End goal: higher level representation as
+   "syntax", rather than text "source code"
+NO "BUILT-IN" OPS
+ - ALL ops are looked up by the evaluator
+ - Goal: maximally self-modifiable system
+*/
+
+</script>
+</body>
+</html>
